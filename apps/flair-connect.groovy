@@ -46,6 +46,8 @@ preferences {
 
 @Field static final String STRUCTURE_DNI_PREFIX = "flair-structure-"
 @Field static final String ROOM_DNI_PREFIX      = "flair-room-"
+@Field static final String PUCK_DNI_PREFIX      = "flair-puck-"
+@Field static final String PUCK2_DNI_PREFIX     = "flair-puck2-"
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Flair Connect", install: true, uninstall: true) {
@@ -343,8 +345,9 @@ private String homeAwaySetByLabel(String raw) {
 private fanOutRelated(List structures) {
     structures.each { s ->
         requestRooms(s.id)
-        // Future phases: requestPucks(s.id), requestPuck2s(s.id),
-        // requestVents(s.id), requestHvacUnits(s.id)
+        requestPucks(s.id)
+        requestPuck2s(s.id)
+        // Future phases: requestVents(s.id), requestHvacUnits(s.id)
     }
 }
 
@@ -416,6 +419,282 @@ private pushRoomState(child, String structureId, item) {
         humidity:      attrs["current-humidity"],
         setPointC:     attrs["set-point-c"],
         active:        attrs["active"],
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Pucks (V1)
+// ---------------------------------------------------------------------------
+
+def requestPucks(String structureId) {
+    if (!state.accessToken) return
+    def params = [
+        uri:     "${API_BASE}/structures/${structureId}/pucks",
+        headers: [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
+        timeout: (httpTimeout ?: 20) as int,
+    ]
+    logDebug "GET /structures/${structureId}/pucks"
+    asynchttpGet("handlePucksResponse", params, [structureId: structureId.toString()])
+}
+
+def handlePucksResponse(resp, data) {
+    if (resp?.hasError()) {
+        def status = resp.getStatus()
+        def retained = (getChildDevices().count { it.deviceNetworkId.startsWith(PUCK_DNI_PREFIX) }) as int
+        if (status in [401, 403]) {
+            logError "pucks fetch unauthorized (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logWarn "pucks fetch failed for structure ${data?.structureId} (status=${status}); retaining ${retained} cached puck child(ren)"
+        }
+        return
+    }
+    def json = null
+    try { json = resp.getJson() } catch (e) { logWarn "pucks response not JSON: ${e.message}"; return }
+    def items = (json?.data ?: []) as List
+    syncPuckChildren(data?.structureId as String, items)
+
+    // V1 pucks have a current-reading sub-resource too (light, room-pressure
+    // live there, not on the list response). Skip inactive ones for the same
+    // reason as V2.
+    items.each { item ->
+        if (item.attributes?.inactive != true) {
+            requestPuckCurrentReading(item.id as String, data?.structureId as String)
+        }
+    }
+}
+
+private syncPuckChildren(String structureId, List items) {
+    def seenDnis = [] as Set
+    items.each { item ->
+        def dni = "${PUCK_DNI_PREFIX}${item.id}".toString()
+        seenDnis << dni
+        def label = "Flair Puck: ${item.attributes?.name ?: item.id}"
+        def child = getOrCreateChild(dni, "Flair Puck", label)
+        if (child) pushPuckState(child, structureId, item)
+    }
+    getChildDevices()
+        .findAll { c ->
+            c.deviceNetworkId.startsWith(PUCK_DNI_PREFIX) &&
+            !(c.deviceNetworkId in seenDnis) &&
+            c.currentValue("structureId")?.toString() == structureId
+        }
+        .each {
+            logInfo "removing orphan puck child: ${it.label} (${it.deviceNetworkId})"
+            deleteChildDevice(it.deviceNetworkId)
+        }
+}
+
+private pushPuckState(child, String structureId, item) {
+    def a = (item.attributes ?: [:]) as Map
+    // Temperature, humidity, voltage, RSSI come from the list response.
+    // Light and pressure live on the current-reading sub-resource and arrive
+    // via a separate handler (pushPuckReading) — see HA sensor.py which uses
+    // attributes['current-rssi'] / attributes['voltage'] / attributes
+    // ['current-temperature-c'] / attributes['current-humidity'] for these,
+    // and current_reading['light'] / current_reading['room-pressure'] for
+    // the rest.
+    child.updateState([
+        puckId:        item.id,
+        structureId:   structureId,
+        temperatureC:  a["current-temperature-c"],
+        humidity:      a["current-humidity"],
+        voltage:       a["voltage"],
+        rssi:          a["current-rssi"],
+        inactive:      a["inactive"],
+    ])
+}
+
+def requestPuckCurrentReading(String puckId, String structureId) {
+    if (!state.accessToken) return
+    def params = [
+        uri:     "${API_BASE}/pucks/${puckId}/current-reading",
+        headers: [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
+        timeout: (httpTimeout ?: 20) as int,
+    ]
+    logDebug "GET /pucks/${puckId}/current-reading"
+    asynchttpGet("handlePuckCurrentReadingResponse", params, [puckId: puckId, structureId: structureId])
+}
+
+def handlePuckCurrentReadingResponse(resp, data) {
+    if (resp?.hasError()) {
+        // Retain previous reading on transient failure (§9).
+        def status = resp.getStatus()
+        if (status in [401, 403]) {
+            logError "current-reading unauthorized for puck ${data?.puckId} (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logWarn "current-reading failed for puck ${data?.puckId} (status=${status}); retaining previous reading"
+        }
+        return
+    }
+    def json = null
+    try { json = resp.getJson() } catch (e) { logWarn "current-reading not JSON for puck ${data?.puckId}: ${e.message}"; return }
+
+    def reading = (json?.data?.attributes ?: [:]) as Map
+    def dni = "${PUCK_DNI_PREFIX}${data.puckId}".toString()
+    def child = getChildDevice(dni)
+    if (!child) {
+        logDebug "current-reading landed for puck ${data?.puckId} but no child exists yet — ignoring"
+        return
+    }
+    child.updateState([
+        light:    scaleLight(reading["light"]),
+        pressure: reading["room-pressure"],
+    ])
+}
+
+/**
+ * Scale Flair's raw light reading to lux. Matches the formula in HA's
+ * sensor.py: (raw / 100) * 200 — i.e. raw × 2. Returns null on null input
+ * so the driver's "skip null" rule keeps previous lux intact.
+ */
+private scaleLight(raw) {
+    if (raw == null) return null
+    return (raw as BigDecimal) * 2
+}
+
+// ---------------------------------------------------------------------------
+// Pucks V2 — see FLAIR_DOMAIN_NOTES §5. Lives under a separate relationship
+// and type key (puck2s), and each active V2's live sensor values must be
+// fetched from a second endpoint (/puck2s/{id}/current-reading).
+//
+// Retain-on-failure invariant (§9): if either fetch fails, do not blank
+// existing state. The driver's updateState only emits sendEvent for non-null
+// values, so simply not calling it with readings keeps the previous values.
+// ---------------------------------------------------------------------------
+
+def requestPuck2s(String structureId) {
+    if (!state.accessToken) return
+    def params = [
+        uri:     "${API_BASE}/structures/${structureId}/puck2s",
+        headers: [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
+        timeout: (httpTimeout ?: 20) as int,
+    ]
+    logDebug "GET /structures/${structureId}/puck2s"
+    asynchttpGet("handlePuck2sResponse", params, [structureId: structureId.toString()])
+}
+
+def handlePuck2sResponse(resp, data) {
+    if (resp?.hasError()) {
+        def status = resp.getStatus()
+        def retained = (getChildDevices().count { it.deviceNetworkId.startsWith(PUCK2_DNI_PREFIX) }) as int
+        if (status in [401, 403]) {
+            logError "puck2s fetch unauthorized (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logWarn "puck2s fetch failed for structure ${data?.structureId} (status=${status}); retaining ${retained} cached puck2 child(ren)"
+        }
+        return
+    }
+    def json = null
+    try { json = resp.getJson() } catch (e) { logWarn "puck2s response not JSON: ${e.message}"; return }
+    def items = (json?.data ?: []) as List
+    syncPuck2Children(data?.structureId as String, items)
+
+    // For each active V2, kick off the current-reading sub-fetch. Inactive
+    // pucks would only return a stale or empty reading; skip them.
+    items.each { item ->
+        if (item.attributes?.inactive != true) {
+            requestPuck2CurrentReading(item.id as String, data?.structureId as String)
+        }
+    }
+}
+
+private syncPuck2Children(String structureId, List items) {
+    def seenDnis = [] as Set
+    items.each { item ->
+        def dni = "${PUCK2_DNI_PREFIX}${item.id}".toString()
+        seenDnis << dni
+        def label = "Flair Puck V2: ${item.attributes?.name ?: item.id}"
+        def child = getOrCreateChild(dni, "Flair Puck V2", label)
+        if (child) pushPuck2Meta(child, structureId, item)
+    }
+    getChildDevices()
+        .findAll { c ->
+            c.deviceNetworkId.startsWith(PUCK2_DNI_PREFIX) &&
+            !(c.deviceNetworkId in seenDnis) &&
+            c.currentValue("structureId")?.toString() == structureId
+        }
+        .each {
+            logInfo "removing orphan puck2 child: ${it.label} (${it.deviceNetworkId})"
+            deleteChildDevice(it.deviceNetworkId)
+        }
+}
+
+/**
+ * Pushes the V2 metadata + the sensor values that live on the puck2s list
+ * response (everything except light and pressure, which arrive separately
+ * via the current-reading sub-fetch). The HA sensor.py for V2 reads
+ * temperature, humidity, voltage, and current-rssi directly from
+ * puck2_data.attributes — see lines 1518, 1596, 1755, 1845.
+ */
+private pushPuck2Meta(child, String structureId, item) {
+    def a = (item.attributes ?: [:]) as Map
+    child.updateState([
+        puckId:                item.id,
+        structureId:           structureId,
+        // Sensor values from the list response:
+        temperatureC:          a["current-temperature-c"],
+        humidity:              a["current-humidity"],
+        voltage:               a["voltage"],
+        rssi:                  a["current-rssi"],
+        inactive:              a["inactive"],
+        // V2-specific metadata:
+        displayColor:          a["puck-display-color"],
+        temperatureScale:      a["temperature-scale"],
+        setpointBoundLow:      a["setpoint-bound-low"],
+        setpointBoundHigh:     a["setpoint-bound-high"],
+        temperatureOffset:     a["temperature-offset-override-c"],
+        locked:                a["locked"],
+    ])
+}
+
+def requestPuck2CurrentReading(String puck2Id, String structureId) {
+    if (!state.accessToken) return
+    def params = [
+        uri:     "${API_BASE}/puck2s/${puck2Id}/current-reading",
+        headers: [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
+        timeout: (httpTimeout ?: 20) as int,
+    ]
+    logDebug "GET /puck2s/${puck2Id}/current-reading"
+    asynchttpGet("handlePuck2CurrentReadingResponse", params, [puck2Id: puck2Id, structureId: structureId])
+}
+
+def handlePuck2CurrentReadingResponse(resp, data) {
+    if (resp?.hasError()) {
+        // Per FLAIR_DOMAIN_NOTES §9: retain previous reading on transient
+        // failure. Do not blank values on the child — simply log and exit.
+        def status = resp.getStatus()
+        if (status in [401, 403]) {
+            logError "current-reading unauthorized for puck2 ${data?.puck2Id} (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logWarn "current-reading failed for puck2 ${data?.puck2Id} (status=${status}); retaining previous reading"
+        }
+        return
+    }
+    def json = null
+    try { json = resp.getJson() } catch (e) { logWarn "current-reading not JSON for puck2 ${data?.puck2Id}: ${e.message}"; return }
+
+    def reading = (json?.data?.attributes ?: [:]) as Map
+    def dni = "${PUCK2_DNI_PREFIX}${data.puck2Id}".toString()
+    def child = getChildDevice(dni)
+    if (!child) {
+        logDebug "current-reading landed for puck2 ${data?.puck2Id} but no child exists yet — ignoring"
+        return
+    }
+    // V2 hardware lacks light and pressure sensors. RSSI uses sub-ghz-rssi
+    // (the radio used to reach the bridge), not current-rssi which may be
+    // null in the V2 list response. HVAC IR-signaling fields in
+    // current-reading (mode-status, fan-speed-status, ir-device-set-point,
+    // etc.) are intentionally NOT surfaced here — those reflect what the
+    // puck is currently transmitting, not the authoritative HVAC unit
+    // state. The actual HVAC control entity is the paired hvac-units
+    // resource, surfaced by the Flair HVAC Unit driver in a later phase.
+    child.updateState([
+        rssi:             reading["sub-ghz-rssi"],
+        connectedGateway: reading["connected-gateway-name"],
     ])
 }
 
