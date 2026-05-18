@@ -45,6 +45,7 @@ preferences {
 @Field static final long TOKEN_REFRESH_SKEW_MS = 60_000L
 
 @Field static final String STRUCTURE_DNI_PREFIX = "flair-structure-"
+@Field static final String ROOM_DNI_PREFIX      = "flair-room-"
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Flair Connect", install: true, uninstall: true) {
@@ -218,6 +219,7 @@ def handleDiscoveryResponse(resp, data) {
     state.structureNames = items.collectEntries { [(it.id): it.attributes?.name] }
 
     syncStructureChildren(items)
+    fanOutRelated(items)
 
     if (data?.initial) {
         logInfo "discovered ${items.size()} structure(s): ${state.structureNames?.values()}"
@@ -231,6 +233,48 @@ def handleDiscoveryResponse(resp, data) {
 // Child device wiring
 // ---------------------------------------------------------------------------
 
+/**
+ * Idempotent child lookup-or-create. Returns the child device (existing or
+ * just created), or null if creation truly failed.
+ *
+ * Tolerates DuplicateDNIException as a benign race: two concurrent fan-outs
+ * (e.g. a scheduled poll overlapping a manual Done) can both pass the
+ * getChildDevice() null-check before either addChildDevice() returns. The
+ * loser of that race re-fetches the just-created device and continues.
+ */
+private getOrCreateChild(String dni, String typeName, String label) {
+    def child = getChildDevice(dni)
+    if (child) return child
+    try {
+        child = addChildDevice(
+            "holocronology", typeName, dni,
+            [name: typeName, label: label, isComponent: false]
+        )
+        logInfo "created child device: ${label} (${dni})"
+        return child
+    } catch (e) {
+        // The Hubitat sandbox doesn't expose specific exception classes from
+        // com.hubitat.app.exception in a way we can name in a catch clause,
+        // so we sniff the class's simpleName / message instead. This keeps
+        // the two known benign cases (race-induced duplicate, missing driver
+        // type) actionable without coupling us to a FQN that may shift
+        // between Hubitat versions.
+        def cls = e.class.simpleName
+        def msg = e.message?.toLowerCase() ?: ""
+        if (cls.contains("Duplicate") || msg.contains("already exists")) {
+            // Concurrent fan-out winner already created it. Look it up.
+            logDebug "DNI ${dni} created by a concurrent fan-out (${cls}); using existing child"
+            return getChildDevice(dni)
+        }
+        if (cls.contains("UnknownDeviceType") || msg.contains("device type")) {
+            logError "${typeName} driver not installed — paste the corresponding driver into Drivers Code, then re-run discovery"
+            return null
+        }
+        logError "failed to create child ${dni}: ${cls}: ${e.message}"
+        return null
+    }
+}
+
 private syncStructureChildren(List items) {
     // toString() the DNIs explicitly — GString interpolation produces a
     // GString whose hashCode differs from the plain String that Hubitat
@@ -240,24 +284,9 @@ private syncStructureChildren(List items) {
     items.each { item ->
         def dni = "${STRUCTURE_DNI_PREFIX}${item.id}".toString()
         seenDnis << dni
-        def child = getChildDevice(dni)
-        if (!child) {
-            def label = "Flair: ${item.attributes?.name ?: item.id}"
-            try {
-                child = addChildDevice(
-                    "holocronology", "Flair Structure", dni,
-                    [name: "Flair Structure", label: label, isComponent: false]
-                )
-                logInfo "created child device for structure '${item.attributes?.name}' (${item.id})"
-            } catch (com.hubitat.app.exception.UnknownDeviceTypeException e) {
-                logError "Flair Structure driver not installed — install drivers/flair-structure.groovy in Drivers Code, then re-run discovery"
-                return
-            } catch (e) {
-                logError "failed to create structure child ${item.id}: ${e.class.simpleName}: ${e.message}"
-                return
-            }
-        }
-        pushStructureState(child, item)
+        def label = "Flair: ${item.attributes?.name ?: item.id}"
+        def child = getOrCreateChild(dni, "Flair Structure", label)
+        if (child) pushStructureState(child, item)
     }
     // Reap orphans: structures the user removed from Flair stay as ghosts
     // otherwise.
@@ -303,6 +332,91 @@ private String homeAwaySetByLabel(String raw) {
         case "Flair Autohome Autoaway": return "Flair App Geolocation"
         default: return raw
     }
+}
+
+// ---------------------------------------------------------------------------
+// Related-resource fan-out — for each discovered structure, kick off async
+// fetches for its rooms/pucks/vents/hvac-units. Each handler updates only
+// its own DNI namespace, so they're independent and don't need a join.
+// ---------------------------------------------------------------------------
+
+private fanOutRelated(List structures) {
+    structures.each { s ->
+        requestRooms(s.id)
+        // Future phases: requestPucks(s.id), requestPuck2s(s.id),
+        // requestVents(s.id), requestHvacUnits(s.id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rooms
+// ---------------------------------------------------------------------------
+
+def requestRooms(String structureId) {
+    if (!state.accessToken) return
+    def params = [
+        uri:     "${API_BASE}/structures/${structureId}/rooms",
+        headers: [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
+        timeout: (httpTimeout ?: 20) as int,
+    ]
+    logDebug "GET /structures/${structureId}/rooms"
+    asynchttpGet("handleRoomsResponse", params, [structureId: structureId.toString()])
+}
+
+def handleRoomsResponse(resp, data) {
+    if (resp?.hasError()) {
+        def status = resp.getStatus()
+        def retained = (getChildDevices().count { it.deviceNetworkId.startsWith(ROOM_DNI_PREFIX) }) as int
+        if (status in [401, 403]) {
+            logError "rooms fetch unauthorized (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logWarn "rooms fetch failed for structure ${data?.structureId} (status=${status}); retaining ${retained} cached room child(ren)"
+        }
+        return
+    }
+    def json = null
+    try { json = resp.getJson() } catch (e) { logWarn "rooms response not JSON: ${e.message}"; return }
+
+    def items = (json?.data ?: []) as List
+    syncRoomChildren(data?.structureId as String, items)
+}
+
+private syncRoomChildren(String structureId, List items) {
+    def seenDnis = [] as Set
+    items.each { item ->
+        def dni = "${ROOM_DNI_PREFIX}${item.id}".toString()
+        seenDnis << dni
+        def label = "Flair Room: ${item.attributes?.name ?: item.id}"
+        def child = getOrCreateChild(dni, "Flair Room", label)
+        if (child) pushRoomState(child, structureId, item)
+    }
+    // Reap only the rooms tied to *this* structure: we don't have visibility
+    // into rooms of other structures yet (each call is per-structure), so we
+    // restrict the orphan set to children whose structureId attribute
+    // matches this structureId.
+    getChildDevices()
+        .findAll { c ->
+            c.deviceNetworkId.startsWith(ROOM_DNI_PREFIX) &&
+            !(c.deviceNetworkId in seenDnis) &&
+            c.currentValue("structureId")?.toString() == structureId
+        }
+        .each {
+            logInfo "removing orphan room child: ${it.label} (${it.deviceNetworkId})"
+            deleteChildDevice(it.deviceNetworkId)
+        }
+}
+
+private pushRoomState(child, String structureId, item) {
+    def attrs = (item.attributes ?: [:]) as Map
+    child.updateState([
+        roomId:        item.id,
+        structureId:   structureId,
+        temperatureC:  attrs["current-temperature-c"],
+        humidity:      attrs["current-humidity"],
+        setPointC:     attrs["set-point-c"],
+        active:        attrs["active"],
+    ])
 }
 
 // ---------------------------------------------------------------------------
