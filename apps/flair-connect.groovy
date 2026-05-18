@@ -48,6 +48,7 @@ preferences {
 @Field static final String ROOM_DNI_PREFIX      = "flair-room-"
 @Field static final String PUCK_DNI_PREFIX      = "flair-puck-"
 @Field static final String PUCK2_DNI_PREFIX     = "flair-puck2-"
+@Field static final String HVAC_DNI_PREFIX      = "flair-hvac-"
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Flair Connect", install: true, uninstall: true) {
@@ -219,6 +220,10 @@ def handleDiscoveryResponse(resp, data) {
     def items = (json?.data ?: []) as List
     state.structureIds   = items.collect { it.id }
     state.structureNames = items.collectEntries { [(it.id): it.attributes?.name] }
+    // Cache the full structure attributes so the HVAC fan-out handler can
+    // apply the §4.4 decision tree (HVAC displayed mode depends on the
+    // structure's mode and structure-heat-cool-mode).
+    state.structureAttrs = items.collectEntries { [(it.id.toString()): it.attributes ?: [:]] }
 
     syncStructureChildren(items)
     fanOutRelated(items)
@@ -347,7 +352,8 @@ private fanOutRelated(List structures) {
         requestRooms(s.id)
         requestPucks(s.id)
         requestPuck2s(s.id)
-        // Future phases: requestVents(s.id), requestHvacUnits(s.id)
+        requestHvacUnits(s.id)
+        // Future phase: requestVents(s.id)
     }
 }
 
@@ -699,8 +705,211 @@ def handlePuck2CurrentReadingResponse(resp, data) {
 }
 
 // ---------------------------------------------------------------------------
-// Polling — async. For Phase 1 this just re-fetches structures to keep the
-// connection warm. Phase 2 will fan out to rooms/pucks/vents/hvac-units.
+// HVAC units — the authoritative controllable HVAC entity. The puck merely
+// transmits IR; the hvac-units resource is what gets read and (later) written
+// to control mode/fan/swing/setpoint. See FLAIR_DOMAIN_NOTES §4 and §5.
+// ---------------------------------------------------------------------------
+
+def requestHvacUnits(String structureId) {
+    if (!state.accessToken) return
+    def params = [
+        uri:     "${API_BASE}/structures/${structureId}/hvac-units",
+        headers: [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
+        timeout: (httpTimeout ?: 20) as int,
+    ]
+    logDebug "GET /structures/${structureId}/hvac-units"
+    asynchttpGet("handleHvacUnitsResponse", params, [structureId: structureId.toString()])
+}
+
+def handleHvacUnitsResponse(resp, data) {
+    if (resp?.hasError()) {
+        def status = resp.getStatus()
+        def retained = (getChildDevices().count { it.deviceNetworkId.startsWith(HVAC_DNI_PREFIX) }) as int
+        if (status in [401, 403]) {
+            logError "hvac-units fetch unauthorized (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logWarn "hvac-units fetch failed for structure ${data?.structureId} (status=${status}); retaining ${retained} cached HVAC child(ren)"
+        }
+        return
+    }
+    def json = null
+    try { json = resp.getJson() } catch (e) { logWarn "hvac-units response not JSON: ${e.message}"; return }
+    def items = (json?.data ?: []) as List
+    syncHvacUnitChildren(data?.structureId as String, items)
+}
+
+private syncHvacUnitChildren(String structureId, List items) {
+    def seenDnis = [] as Set
+    items.each { item ->
+        def dni = "${HVAC_DNI_PREFIX}${item.id}".toString()
+        seenDnis << dni
+        def label = "Flair HVAC: ${item.attributes?.name ?: item.id}"
+        def child = getOrCreateChild(dni, "Flair HVAC Unit", label)
+        if (child) pushHvacUnitState(child, structureId, item)
+    }
+    getChildDevices()
+        .findAll { c ->
+            c.deviceNetworkId.startsWith(HVAC_DNI_PREFIX) &&
+            !(c.deviceNetworkId in seenDnis) &&
+            c.currentValue("structureId")?.toString() == structureId
+        }
+        .each {
+            logInfo "removing orphan HVAC child: ${it.label} (${it.deviceNetworkId})"
+            deleteChildDevice(it.deviceNetworkId)
+        }
+}
+
+private pushHvacUnitState(child, String structureId, item) {
+    def a = (item.attributes ?: [:]) as Map
+    def rels = (item.relationships ?: [:]) as Map
+
+    // Puck resolution per FLAIR_DOMAIN_NOTES §5: V1 first, V2 fallback.
+    def puckRel = rels["puck"]?.data
+    def puck2Rel = rels["puck2"]?.data
+    def puckId = null
+    def puckType = null
+    if (puckRel?.id)       { puckId = puckRel.id;  puckType = "V1" }
+    else if (puck2Rel?.id) { puckId = puck2Rel.id; puckType = "V2" }
+
+    def roomId = rels["room"]?.data?.id
+
+    // Constraints can be a Map (full mini-split with capability matrix) or
+    // a List (button-only IR units with no fine control). Drivers that work
+    // off a List get most controllable fields blanked.
+    def constraints = a["constraints"]
+    def constraintsShape = (constraints instanceof Map) ? "dict"
+                         : (constraints instanceof List) ? "list"
+                         : null
+
+    // Native temperature scale: first from constraints["temperature-scale"],
+    // then from codesets[0]["temperature-scale"]. Default to F if missing —
+    // the HA repo's climate.py treats missing-scale as user-actionable but
+    // for a read-only display, F is the safer default for US mini-splits.
+    def nativeScale = null
+    if (constraintsShape == "dict")     nativeScale = constraints["temperature-scale"]
+    if (!nativeScale) {
+        def cs = a["codesets"]
+        if (cs instanceof List && cs && cs[0] instanceof Map) {
+            nativeScale = cs[0]["temperature-scale"]
+        }
+    }
+    nativeScale = nativeScale ?: "F"
+
+    // Available modes: keys of constraints["ON"] — the per-mode sub-tree.
+    def availableModes = []
+    if (constraintsShape == "dict" && constraints["ON"] instanceof Map) {
+        availableModes = constraints["ON"].keySet().toList()
+    }
+
+    // Available fan speeds for the current mode: drill into
+    // constraints["ON"][<mode>]["ON"|"OFF"]. Prefer "ON" (power-on tree).
+    // Groovy's ?. doesn't compose with [...] — gets parsed as a ternary —
+    // so each indexing step is null-checked manually.
+    def availableFanSpeeds = []
+    def rawModeUpper = (a["mode"] ?: "").toString().toUpperCase()
+    if (constraintsShape == "dict" && rawModeUpper && constraints["ON"] instanceof Map) {
+        def modeTree = constraints["ON"][rawModeUpper]
+        if (modeTree instanceof Map) {
+            def fanMap = modeTree["ON"] instanceof Map ? modeTree["ON"] : modeTree["OFF"]
+            if (fanMap instanceof Map) availableFanSpeeds = fanMap.keySet().toList()
+        }
+    }
+
+    // Apply the §4.4 decision tree using cached structure attributes.
+    def structureAttrs = ((state.structureAttrs instanceof Map) ? (state.structureAttrs[structureId] ?: [:]) : [:]) as Map
+    def displayedMode   = computeDisplayedMode(structureAttrs, a)
+    def displayedAction = computeDisplayedAction(displayedMode, a["power"])
+
+    // Target temperature: convert from the unit's native scale to the hub's.
+    def targetTemperatureHub = null
+    def rawTemp = a["temperature"]
+    if (rawTemp != null) {
+        targetTemperatureHub = convertTemperatureScale(rawTemp as BigDecimal, nativeScale, location.temperatureScale)
+                                ?.setScale(1, java.math.RoundingMode.HALF_UP)
+    }
+
+    child.updateState([
+        hvacUnitId:             item.id,
+        structureId:            structureId,
+        roomId:                 roomId,
+        puckId:                 puckId,
+        puckType:               puckType,
+        manufacturer:           a["make-name"],
+        power:                  a["power"],
+        rawMode:                a["mode"],
+        displayedMode:          displayedMode,
+        displayedAction:        displayedAction,
+        targetTemperatureHub:   targetTemperatureHub,
+        temperatureScaleNative: nativeScale,
+        fanSpeed:               a["fan-speed"],
+        swing:                  a["swing"] ?: "Not Supported",
+        availableModes:         availableModes,
+        availableFanSpeeds:     availableFanSpeeds,
+        supportsSwing:          (a["swing"] != null) ? "true" : "false",
+        constraintsShape:       constraintsShape,
+    ])
+}
+
+/**
+ * §4.4 decision tree for the user-visible HVAC mode.
+ *
+ *   if structure.mode == "auto":
+ *     if structure-heat-cool-mode == "float":
+ *       → Off (force, override unit's own mode attribute)
+ *     else:
+ *       → use unit's mode attribute as-is
+ *   elif structure.mode == "manual":
+ *     if unit.power == "Off":
+ *       → Off
+ *     else:
+ *       → use unit's mode attribute as-is
+ */
+private String computeDisplayedMode(Map structureAttrs, Map hvacAttrs) {
+    def systemMode    = structureAttrs["mode"]
+    def heatCoolMode  = structureAttrs["structure-heat-cool-mode"]
+    def power         = hvacAttrs["power"]
+    def rawMode       = hvacAttrs["mode"]
+
+    if (systemMode == "auto") {
+        return (heatCoolMode == "float") ? "Off" : (rawMode ?: "Unknown")
+    }
+    if (systemMode == "manual") {
+        return (power == "Off") ? "Off" : (rawMode ?: "Unknown")
+    }
+    return rawMode ?: "Unknown"
+}
+
+/** Friendly "what is the unit doing right now" string for the tile. */
+private String computeDisplayedAction(String displayedMode, String power) {
+    if (displayedMode == "Off" || power != "On") return "Off"
+    switch (displayedMode) {
+        case "Heat":  return "Heating"
+        case "Cool":  return "Cooling"
+        case "Dry":   return "Drying"
+        case "Fan":   return "Fan"
+        case "Auto":  return "Auto"
+        default:      return "Idle"
+    }
+}
+
+/** Convert between F/C/K. Returns null on null input. */
+private BigDecimal convertTemperatureScale(BigDecimal value, String fromScale, String toScale) {
+    if (value == null) return null
+    if (fromScale == toScale) return value
+    // Normalise via Celsius.
+    def celsius = value
+    if (fromScale == "F") celsius = (value - 32) * 5 / 9
+    else if (fromScale == "K") celsius = value - 273.15
+    if (toScale == "F") return celsius * 9 / 5 + 32
+    if (toScale == "K") return celsius + 273.15
+    return celsius
+}
+
+// ---------------------------------------------------------------------------
+// Polling — async. Re-fetches structures and fans out to related resources
+// for each. Resilience: on transient failures children retain their
+// previously pushed state rather than blanking.
 // ---------------------------------------------------------------------------
 
 def poll() {
