@@ -44,6 +44,8 @@ preferences {
 // straddles the boundary doesn't burn a 401.
 @Field static final long TOKEN_REFRESH_SKEW_MS = 60_000L
 
+@Field static final String STRUCTURE_DNI_PREFIX = "flair-structure-"
+
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Flair Connect", install: true, uninstall: true) {
         section("Flair credentials") {
@@ -215,11 +217,91 @@ def handleDiscoveryResponse(resp, data) {
     state.structureIds   = items.collect { it.id }
     state.structureNames = items.collectEntries { [(it.id): it.attributes?.name] }
 
+    syncStructureChildren(items)
+
     if (data?.initial) {
         logInfo "discovered ${items.size()} structure(s): ${state.structureNames?.values()}"
         schedulePoll()
     } else {
         logDebug "poll refresh: ${items.size()} structure(s)"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Child device wiring
+// ---------------------------------------------------------------------------
+
+private syncStructureChildren(List items) {
+    // toString() the DNIs explicitly — GString interpolation produces a
+    // GString whose hashCode differs from the plain String that Hubitat
+    // returns from getChildDevices(), so without coercion the just-created
+    // child is wrongly flagged as an orphan on the very next pass.
+    def seenDnis = [] as Set
+    items.each { item ->
+        def dni = "${STRUCTURE_DNI_PREFIX}${item.id}".toString()
+        seenDnis << dni
+        def child = getChildDevice(dni)
+        if (!child) {
+            def label = "Flair: ${item.attributes?.name ?: item.id}"
+            try {
+                child = addChildDevice(
+                    "holocronology", "Flair Structure", dni,
+                    [name: "Flair Structure", label: label, isComponent: false]
+                )
+                logInfo "created child device for structure '${item.attributes?.name}' (${item.id})"
+            } catch (com.hubitat.app.exception.UnknownDeviceTypeException e) {
+                logError "Flair Structure driver not installed — install drivers/flair-structure.groovy in Drivers Code, then re-run discovery"
+                return
+            } catch (e) {
+                logError "failed to create structure child ${item.id}: ${e.class.simpleName}: ${e.message}"
+                return
+            }
+        }
+        pushStructureState(child, item)
+    }
+    // Reap orphans: structures the user removed from Flair stay as ghosts
+    // otherwise.
+    getChildDevices()
+        .findAll { it.deviceNetworkId.startsWith(STRUCTURE_DNI_PREFIX) && !(it.deviceNetworkId in seenDnis) }
+        .each {
+            logInfo "removing orphan structure child: ${it.label} (${it.deviceNetworkId})"
+            deleteChildDevice(it.deviceNetworkId)
+        }
+}
+
+private pushStructureState(child, item) {
+    def attrs = (item.attributes ?: [:]) as Map
+    child.updateState([
+        structureId:         item.id,
+        systemMode:          attrs["mode"],
+        heatCoolMode:        attrs["structure-heat-cool-mode"],
+        setPoint:            attrs["set-point-temperature-c"],
+        setPointController:  setPointControllerLabel(attrs["set-point-mode"]),
+        awayMode:            attrs["structure-away-mode"],
+        // 'home' is the actual presence state (boolean); 'home-away-mode' is
+        // a misleading name — it's the setter source (Manual / Thermostat /
+        // Geolocation), see select.py HomeAwayModeSetBy in the HA repo.
+        homeAway:            attrs.containsKey("home") ? (attrs["home"] ? "Home" : "Away") : null,
+        homeAwaySetBy:       homeAwaySetByLabel(attrs["home-away-mode"]),
+    ])
+}
+
+/** Map Flair's raw set-point-mode enum to the friendly labels from HA's const.py. */
+private String setPointControllerLabel(String raw) {
+    switch (raw) {
+        case "Home Evenness For Active Rooms Follow Third Party": return "Thermostat"
+        case "Home Evenness For Active Rooms Flair Setpoint":     return "Flair App"
+        default: return raw
+    }
+}
+
+/** Map Flair's raw home-away-mode enum to friendly source labels. */
+private String homeAwaySetByLabel(String raw) {
+    switch (raw) {
+        case "Manual":                  return "Manual"
+        case "Third Party Home Away":   return "Thermostat"
+        case "Flair Autohome Autoaway": return "Flair App Geolocation"
+        default: return raw
     }
 }
 
