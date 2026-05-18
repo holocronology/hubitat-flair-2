@@ -319,7 +319,7 @@ If starting fresh on a new platform, this is roughly the order that minimizes re
 3. Rooms + room temperature/humidity sensors
 4. Pucks **and** Puck V2 (do both at once — don't defer V2, you'll just retrofit later)
 5. HVAC units (read-only display first, controls after)
-6. Vents (display before control)
+6. Vents (display before control) — **Hubitat note: intentionally not covered by this repo. [ljbotero/hubitat-flair-vents](https://github.com/ljbotero/hubitat-flair-vents) is the mature solution for Hubitat vent control; this repo (hubitat-flair-2) covers everything else.**
 7. Structure-level system mode select + Away mode switch
 8. HVAC unit controls (mode, fan, swing, setpoint)
 9. Diagnostics

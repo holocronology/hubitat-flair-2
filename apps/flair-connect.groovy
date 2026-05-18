@@ -1,10 +1,15 @@
 /**
- *  Flair Connect
+ *  Flair Climate Connect
  *
- *  Parent app for the Flair Hubitat integration. Owns OAuth 2.0 credentials,
- *  the token lifecycle, all outbound HTTP, structure discovery, and the
- *  polling scheduler. Child devices call back into this app for API access
- *  rather than making their own HTTP calls.
+ *  Parent app for the holocronology/hubitat-flair-2 integration. Covers
+ *  the temperature-control side of Flair: Structures, Rooms, Pucks (V1
+ *  and V2), and HVAC Units. Vents are intentionally out of scope —
+ *  ljbotero/hubitat-flair-vents already covers them well.
+ *
+ *  Owns OAuth 2.0 credentials, the token lifecycle, all outbound HTTP,
+ *  structure discovery, and the polling scheduler. Child devices call
+ *  back into this app for API access rather than making their own HTTP
+ *  calls.
  *
  *  Licensed under the MIT License. See LICENSE in the repo root.
  */
@@ -12,10 +17,10 @@
 import groovy.transform.Field
 
 definition(
-    name: "Flair Connect",
+    name: "Flair Climate Connect",
     namespace: "holocronology",
     author: "holocronology",
-    description: "Flair smart vents and HVAC integration",
+    description: "Flair Structures, Rooms, Pucks (V1/V2), and HVAC Units. Pair with ljbotero/hubitat-flair-vents for vents.",
     category: "Climate",
     iconUrl: "",
     iconX2Url: "",
@@ -51,7 +56,7 @@ preferences {
 @Field static final String HVAC_DNI_PREFIX      = "flair-hvac-"
 
 def mainPage() {
-    dynamicPage(name: "mainPage", title: "Flair Connect", install: true, uninstall: true) {
+    dynamicPage(name: "mainPage", title: "Flair Climate Connect", install: true, uninstall: true) {
         section("Flair credentials") {
             input "clientId",     "string",   title: "Client ID",     required: true
             input "clientSecret", "password", title: "Client Secret", required: true
