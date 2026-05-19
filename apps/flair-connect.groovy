@@ -316,7 +316,7 @@ private pushStructureState(child, item) {
         structureId:         item.id,
         systemMode:          attrs["mode"],
         heatCoolMode:        attrs["structure-heat-cool-mode"],
-        setPoint:            attrs["set-point-temperature-c"],
+        setPointC:           attrs["set-point-temperature-c"],   // driver converts to hub's unit
         setPointController:  setPointControllerLabel(attrs["set-point-mode"]),
         awayMode:            attrs["structure-away-mode"],
         // 'home' is the actual presence state (boolean); 'home-away-mode' is
@@ -707,6 +707,120 @@ def handlePuck2CurrentReadingResponse(resp, data) {
         rssi:             reading["sub-ghz-rssi"],
         connectedGateway: reading["connected-gateway-name"],
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Writes — async PATCH against /structures/{id}. Children invoke
+// patchStructure() rather than building HTTP requests themselves. The
+// response carries the updated resource (JSON:API contract); we push that
+// straight back to the child so state reflects the server-confirmed values.
+// ---------------------------------------------------------------------------
+
+def patchStructure(String structureId, Map attributes) {
+    if (!state.accessToken) {
+        logWarn "patch structure ${structureId} skipped — no token"
+        return
+    }
+    if (!(attributes instanceof Map) || attributes.isEmpty()) {
+        logWarn "patch structure ${structureId} skipped — empty attributes"
+        return
+    }
+    // JSON:API request body, passed as a Map so Hubitat's built-in JSON
+    // encoder handles serialization. We can't use 'application/vnd.api+json'
+    // as requestContentType because Hubitat has no encoder registered for
+    // that media type — the request never actually goes out (manifests as
+    // a 408 + "No encoder found" error). Most JSON:API servers accept
+    // application/json for the request body; we still ask for vnd.api+json
+    // in the Accept header for response negotiation.
+    def bodyMap = [
+        data: [
+            type:          "structures",
+            id:            structureId,
+            attributes:    attributes,
+            relationships: [:],
+        ]
+    ]
+    def params = [
+        uri:                "${API_BASE}/structures/${structureId}",
+        headers:            [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
+        contentType:        JSON_API,
+        requestContentType: "application/json",
+        body:               bodyMap,
+        timeout:            (httpTimeout ?: 20) as int,
+    ]
+    logDebug "PATCH /structures/${structureId} attrs=${attributes.keySet()}"
+    asynchttpPatch("handleStructurePatchResponse", params, [structureId: structureId.toString(), attributes: attributes])
+}
+
+def handleStructurePatchResponse(resp, data) {
+    if (resp?.hasError()) {
+        def status = resp.getStatus()
+        def msg = resp.getErrorMessage() ?: ""
+        if (status in [401, 403]) {
+            logError "structure PATCH unauthorized (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logError "structure PATCH failed for ${data?.structureId} (status=${status}): ${msg}"
+        }
+        // On any failure, trigger a re-poll so the child returns to the
+        // server's actual state rather than displaying a value that didn't
+        // actually take.
+        runIn(2, "poll")
+        return
+    }
+
+    def json = parseAsyncJson(resp)
+    // JSON:API PATCH returns the updated resource; push its attributes to
+    // the corresponding child so the device reflects the server-confirmed
+    // state immediately (no waiting for the next 30s poll).
+    def item = json?.data
+    if (item?.id) {
+        def dni = "${STRUCTURE_DNI_PREFIX}${item.id}".toString()
+        def child = getChildDevice(dni)
+        if (child) {
+            // Refresh the cached structure attributes so any subsequent
+            // HVAC handler that fires uses the new state.
+            if (!(state.structureAttrs instanceof Map)) state.structureAttrs = [:]
+            state.structureAttrs[item.id.toString()] = item.attributes ?: [:]
+            pushStructureState(child, item)
+            logInfo "structure ${data?.structureId} updated: ${data?.attributes?.keySet()}"
+            return
+        }
+    }
+    // Fallback: response didn't carry data we recognize. Re-poll to be sure.
+    logDebug "structure PATCH OK but response missing data; scheduling re-poll"
+    runIn(2, "poll")
+}
+
+/**
+ * Best-effort JSON parse of an async HTTP response body.
+ *
+ * Hubitat's asynchttpPatch (and sometimes asynchttpPost/Put) returns the
+ * response body base64-encoded — apparently a compression / content-type
+ * handling quirk on non-GET methods — and resp.getJson() then chokes
+ * trying to parse the base64 string as JSON. The GET handlers haven't hit
+ * this, so we leave them on the simpler resp.getJson() path; PATCH-shaped
+ * handlers route through here, which tries getJson() first then falls
+ * back to manual base64 decode + JsonSlurper.
+ *
+ * Returns the parsed JSON object/Map, or null if both attempts fail.
+ */
+private parseAsyncJson(resp) {
+    if (!resp) return null
+    try {
+        return resp.getJson()
+    } catch (ignored) {
+        // fall through to manual decode
+    }
+    try {
+        def raw = resp.data?.toString()
+        if (!raw) return null
+        def decoded = new String(raw.decodeBase64())
+        return new groovy.json.JsonSlurper().parseText(decoded)
+    } catch (e) {
+        logWarn "async response not parseable as JSON (after base64 fallback): ${e.message}"
+        return null
+    }
 }
 
 // ---------------------------------------------------------------------------
