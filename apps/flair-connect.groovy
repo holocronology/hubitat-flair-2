@@ -717,39 +717,65 @@ def handlePuck2CurrentReadingResponse(resp, data) {
 // ---------------------------------------------------------------------------
 
 def patchStructure(String structureId, Map attributes) {
+    patchResource("structures", structureId, attributes, "handleStructurePatchResponse",
+                  [structureId: structureId.toString()])
+}
+
+def patchHvacUnit(String hvacId, Map attributes) {
+    patchResource("hvac-units", hvacId, attributes, "handleHvacUnitPatchResponse",
+                  [hvacId: hvacId.toString()])
+}
+
+def patchRoom(String roomId, Map attributes) {
+    patchResource("rooms", roomId, attributes, "handleRoomPatchResponse",
+                  [roomId: roomId.toString()])
+}
+
+/**
+ * Generic async JSON:API PATCH against /{type}/{id}.
+ *
+ * Two important serialization notes baked in here:
+ *
+ * 1. Body is passed as a Map so Hubitat's built-in JSON encoder serializes
+ *    it. Passing a pre-stringified JSON body works too but doesn't gain
+ *    anything.
+ * 2. requestContentType is 'application/json', NOT 'application/vnd.api+json'.
+ *    Hubitat's sandbox has no encoder registered for vnd.api+json — using
+ *    it manifests as a 408 + "No encoder found for request content type"
+ *    error before the request leaves the hub. We still ask for vnd.api+json
+ *    via the Accept header so the server negotiates JSON:API for the
+ *    response.
+ *
+ * The `data` map is passed through to the response handler so it has
+ * context (which structure / unit / room was the target).
+ */
+private patchResource(String type, String id, Map attributes, String successHandler, Map data = [:]) {
     if (!state.accessToken) {
-        logWarn "patch structure ${structureId} skipped — no token"
+        logWarn "patch ${type}/${id} skipped — no token"
         return
     }
     if (!(attributes instanceof Map) || attributes.isEmpty()) {
-        logWarn "patch structure ${structureId} skipped — empty attributes"
+        logWarn "patch ${type}/${id} skipped — empty attributes"
         return
     }
-    // JSON:API request body, passed as a Map so Hubitat's built-in JSON
-    // encoder handles serialization. We can't use 'application/vnd.api+json'
-    // as requestContentType because Hubitat has no encoder registered for
-    // that media type — the request never actually goes out (manifests as
-    // a 408 + "No encoder found" error). Most JSON:API servers accept
-    // application/json for the request body; we still ask for vnd.api+json
-    // in the Accept header for response negotiation.
     def bodyMap = [
         data: [
-            type:          "structures",
-            id:            structureId,
+            type:          type,
+            id:            id,
             attributes:    attributes,
             relationships: [:],
         ]
     ]
     def params = [
-        uri:                "${API_BASE}/structures/${structureId}",
+        uri:                "${API_BASE}/${type}/${id}",
         headers:            [Authorization: "Bearer ${state.accessToken}", Accept: JSON_API],
         contentType:        JSON_API,
         requestContentType: "application/json",
         body:               bodyMap,
         timeout:            (httpTimeout ?: 20) as int,
     ]
-    logDebug "PATCH /structures/${structureId} attrs=${attributes.keySet()}"
-    asynchttpPatch("handleStructurePatchResponse", params, [structureId: structureId.toString(), attributes: attributes])
+    logDebug "PATCH /${type}/${id} attrs=${attributes.keySet()}"
+    asynchttpPatch(successHandler, params, data + [type: type, id: id, attributes: attributes])
 }
 
 def handleStructurePatchResponse(resp, data) {
@@ -789,6 +815,75 @@ def handleStructurePatchResponse(resp, data) {
     }
     // Fallback: response didn't carry data we recognize. Re-poll to be sure.
     logDebug "structure PATCH OK but response missing data; scheduling re-poll"
+    runIn(2, "poll")
+}
+
+def handleHvacUnitPatchResponse(resp, data) {
+    if (resp?.hasError()) {
+        def status = resp.getStatus()
+        def msg = resp.getErrorMessage() ?: ""
+        if (status in [401, 403]) {
+            logError "hvac-unit PATCH unauthorized (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logError "hvac-unit PATCH failed for ${data?.hvacId} (status=${status}): ${msg}"
+        }
+        runIn(2, "poll")
+        return
+    }
+    def json = parseAsyncJson(resp)
+    def item = json?.data
+    if (item?.id) {
+        def dni = "${HVAC_DNI_PREFIX}${item.id}".toString()
+        def child = getChildDevice(dni)
+        if (child) {
+            // pushHvacUnitState needs structureId for the §4.4 decision tree;
+            // pull it from the existing child attribute rather than the
+            // response (PATCH responses don't always include relationships).
+            def structureId = child.currentValue("structureId")
+            if (structureId) {
+                pushHvacUnitState(child, structureId, item)
+                logInfo "hvac-unit ${data?.hvacId} updated: ${data?.attributes?.keySet()}"
+                return
+            }
+        }
+    }
+    logDebug "hvac-unit PATCH OK but response missing data; scheduling re-poll"
+    runIn(2, "poll")
+}
+
+def handleRoomPatchResponse(resp, data) {
+    if (resp?.hasError()) {
+        def status = resp.getStatus()
+        def msg = resp.getErrorMessage() ?: ""
+        if (status in [401, 403]) {
+            logError "room PATCH unauthorized (status=${status}) — clearing token"
+            state.accessToken = null
+        } else {
+            logError "room PATCH failed for ${data?.roomId} (status=${status}): ${msg}"
+        }
+        runIn(2, "poll")
+        return
+    }
+    def json = parseAsyncJson(resp)
+    def item = json?.data
+    if (item?.id) {
+        def dni = "${ROOM_DNI_PREFIX}${item.id}".toString()
+        def child = getChildDevice(dni)
+        if (child) {
+            def structureId = child.currentValue("structureId")
+            pushRoomState(child, structureId, item)
+            logInfo "room ${data?.roomId} updated: ${data?.attributes?.keySet()}"
+            // An auto-mode HVAC temperature write lands here (the API target
+            // is the room, not the unit). The HVAC child's targetTemperature
+            // is computed from the unit's own attributes which won't update
+            // until the next poll — schedule one so the user sees fresh
+            // HVAC target state within ~2s rather than waiting up to 30s.
+            runIn(2, "poll")
+            return
+        }
+    }
+    logDebug "room PATCH OK but response missing data; scheduling re-poll"
     runIn(2, "poll")
 }
 
@@ -934,6 +1029,17 @@ private pushHvacUnitState(child, String structureId, item) {
             if (fanMap instanceof Map) availableFanSpeeds = fanMap.keySet().toList()
         }
     }
+    // Fan-only fan speeds — separate list because FAN mode forbids FAN AUTO,
+    // so when the user picks Fan-only via setHvacMode we need to know the
+    // valid alternatives. Same constraint walk but pinned to "FAN".
+    def fanOnlyFanSpeeds = []
+    if (constraintsShape == "dict" && constraints["ON"] instanceof Map) {
+        def fanModeTree = constraints["ON"]["FAN"]
+        if (fanModeTree instanceof Map) {
+            def fanMap = fanModeTree["ON"] instanceof Map ? fanModeTree["ON"] : fanModeTree["OFF"]
+            if (fanMap instanceof Map) fanOnlyFanSpeeds = fanMap.keySet().toList()
+        }
+    }
 
     // Apply the §4.4 decision tree using cached structure attributes.
     def structureAttrs = ((state.structureAttrs instanceof Map) ? (state.structureAttrs[structureId] ?: [:]) : [:]) as Map
@@ -965,6 +1071,7 @@ private pushHvacUnitState(child, String structureId, item) {
         swing:                  a["swing"] ?: "Not Supported",
         availableModes:         availableModes,
         availableFanSpeeds:     availableFanSpeeds,
+        fanOnlyFanSpeeds:       fanOnlyFanSpeeds,
         supportsSwing:          (a["swing"] != null) ? "true" : "false",
         constraintsShape:       constraintsShape,
     ])
