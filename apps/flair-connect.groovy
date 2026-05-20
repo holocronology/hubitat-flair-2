@@ -721,9 +721,19 @@ def patchStructure(String structureId, Map attributes) {
                   [structureId: structureId.toString()])
 }
 
-def patchHvacUnit(String hvacId, Map attributes) {
+/**
+ * PATCH an HVAC unit. Accepts an optional `extraData` map which is passed
+ * through to the response handler; this is how callers thread a `followups`
+ * list of additional single-attribute PATCHes to issue sequentially after
+ * this one succeeds. Flair's /hvac-units endpoint rejects multi-attribute
+ * PATCH bodies with 422, so any caller that needs to change multiple
+ * attributes (e.g. setHvacMode powering on + setting mode + adjusting fan)
+ * must split them into sequential calls. handleHvacUnitPatchResponse picks
+ * up the next followup on each success.
+ */
+def patchHvacUnit(String hvacId, Map attributes, Map extraData = [:]) {
     patchResource("hvac-units", hvacId, attributes, "handleHvacUnitPatchResponse",
-                  [hvacId: hvacId.toString()])
+                  [hvacId: hvacId.toString()] + extraData)
 }
 
 def patchRoom(String roomId, Map attributes) {
@@ -828,11 +838,15 @@ def handleHvacUnitPatchResponse(resp, data) {
         } else {
             logError "hvac-unit PATCH failed for ${data?.hvacId} (status=${status}): ${msg}"
         }
+        // Abort any chained followups — if the first PATCH failed, the
+        // subsequent ones are likely to fail in worse ways. Re-poll to
+        // restore the device to the server's actual state.
         runIn(2, "poll")
         return
     }
     def json = parseAsyncJson(resp)
     def item = json?.data
+    def pushedSuccessfully = false
     if (item?.id) {
         def dni = "${HVAC_DNI_PREFIX}${item.id}".toString()
         def child = getChildDevice(dni)
@@ -844,12 +858,36 @@ def handleHvacUnitPatchResponse(resp, data) {
             if (structureId) {
                 pushHvacUnitState(child, structureId, item)
                 logInfo "hvac-unit ${data?.hvacId} updated: ${data?.attributes?.keySet()}"
-                return
+                pushedSuccessfully = true
             }
         }
     }
-    logDebug "hvac-unit PATCH OK but response missing data; scheduling re-poll"
-    runIn(2, "poll")
+    if (!pushedSuccessfully) {
+        logDebug "hvac-unit PATCH OK but response missing data; scheduling re-poll"
+        runIn(2, "poll")
+    }
+    // Issue the next chained PATCH if any. We do this even when state push
+    // failed above — the chain represents user intent and we shouldn't
+    // silently drop the remaining writes just because the response shape
+    // surprised us.
+    chainNextHvacPatch(data)
+}
+
+/**
+ * If `data.followups` carries additional single-attribute PATCHes, pop the
+ * head and issue it. The remaining items pass through as the next call's
+ * `followups`, so a 3-step sequence runs as 3 chained async PATCH/response
+ * cycles.
+ */
+private chainNextHvacPatch(Map data) {
+    if (!(data?.followups instanceof List) || !data.followups) return
+    def followups = data.followups as List
+    def next = followups[0]
+    def rest  = followups.size() > 1 ? followups[1..-1] : []
+    if (next instanceof Map && next) {
+        logDebug "chaining follow-up PATCH for hvac-unit ${data.hvacId}: ${next.keySet()}"
+        patchHvacUnit(data.hvacId as String, next, [followups: rest])
+    }
 }
 
 def handleRoomPatchResponse(resp, data) {
